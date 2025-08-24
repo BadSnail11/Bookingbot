@@ -2,80 +2,89 @@
 import os
 import re
 import logging
-import sqlite3
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
+from typing import List, Dict, Any, Optional
 
+import requests
 from dotenv import load_dotenv
 from telegram import (
-    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+    Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters, ContextTypes,
     ConversationHandler, CallbackQueryHandler
 )
 
-# ---- Logging ----
+import asyncio
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# ---- Load env ----
 load_dotenv()
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     raise RuntimeError("Please set TELEGRAM_BOT_TOKEN in your .env")
 
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x.strip().isdigit()}
+ADMIN_ALERT_BOT_TOKEN = os.getenv("ADMIN_ALERT_BOT_TOKEN", "")
+ADMIN_ALERT_CHAT_IDS = [int(x) for x in os.getenv("ADMIN_ALERT_CHAT_IDS","").replace(" ","").split(",") if x.strip().isdigit()]
+
 VENUE_NAME = os.getenv("VENUE_NAME", "Your Venue")
 VENUE_PHONE = os.getenv("VENUE_PHONE", "+00 000 000 000")
 VENUE_ADDRESS = os.getenv("VENUE_ADDRESS", "City, Street 1")
 VENUE_HOURS = os.getenv("VENUE_HOURS", "Daily 10:00–22:00")
+
 RESERVATION_DURATION_MIN = int(os.getenv("RESERVATION_DURATION_MIN", "120"))
 TIME_SLOT_STEP_MIN = int(os.getenv("TIME_SLOT_STEP_MIN", "30"))
-DB_PATH = os.getenv("DB_PATH", "reservations.db")
-
-# Booking window config
-MIN_ADVANCE_DAYS = int(os.getenv("MIN_ADVANCE_DAYS", "1"))  # 1 => no same‑day
+MIN_ADVANCE_DAYS = int(os.getenv("MIN_ADVANCE_DAYS", "1"))
 ONLY_TOMORROW = os.getenv("ONLY_TOMORROW", "false").lower() in ("1", "true", "yes", "y")
-
-# Default timezone for user input
+REMINDER_HOURS_BEFORE = int(os.getenv("REMINDER_HOURS_BEFORE", "2"))
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Moscow"))
 
-# ---- Weekly schedule ----
-# Monday=0 ... Sunday=6
-WEEKLY_RULES = {
-    0: (time(16,0), time(22,30)),  # Mon
-    1: (time(16,0), time(22,30)),  # Tue
-    2: (time(16,0), time(22,30)),  # Wed
-    3: (time(16,0), time(22,30)),  # Thu
-    4: (time(16,0), time(23,30)),  # Fri
-    5: (time(14,0), time(23,30)),  # Sat
-    6: (time(14,0), time(22,30)),  # Sun
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
+if not SUPABASE_URL or not SUPABASE_API_KEY:
+    raise RuntimeError("Please set SUPABASE_URL and SUPABASE_API_KEY in your .env")
+
+REST_BASE = SUPABASE_URL.rstrip("/") + "/rest/v1"
+SB_HEADERS = {
+    "apikey": SUPABASE_API_KEY,
+    "Authorization": f"Bearer {SUPABASE_API_KEY}",
+    "Content-Type": "application/json",
+    "Accept": "application/json",
 }
 
-# ---- DB helpers ----
-def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+def sb_get(table: str, params: Dict[str, str]) -> List[Dict[str, Any]]:
+    r = requests.get(f"{REST_BASE}/{table}", headers=SB_HEADERS, params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
 
-def ensure_user(con, update: Update):
-    chat = update.effective_chat
-    user = update.effective_user
-    con.execute(
-        "INSERT OR IGNORE INTO users (chat_id, first_name, last_name, username) VALUES (?,?,?,?)",
-        (chat.id, user.first_name, user.last_name, user.username),
-    )
-    con.commit()
-    cur = con.execute("SELECT id FROM users WHERE chat_id=?", (chat.id,))
-    return cur.fetchone()["id"]
+def sb_post(table: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(f"{REST_BASE}/{table}", headers={**SB_HEADERS, "Prefer":"return=representation"}, json=payload, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return data[0] if isinstance(data, list) else data
 
-# ---- Conversation states ----
-DATE, TIME, PARTY, NAME, PHONE, CONFIRM = range(6)
+def sb_patch(table: str, params: Dict[str, str], payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    r = requests.patch(f"{REST_BASE}/{table}", headers={**SB_HEADERS, "Prefer":"return=representation"}, params=params, json=payload, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else [data]
 
-# Simple validators
+WEEKLY_RULES = {
+    0: (time(16,0), time(22,30)),
+    1: (time(16,0), time(22,30)),
+    2: (time(16,0), time(22,30)),
+    3: (time(16,0), time(22,30)),
+    4: (time(16,0), time(23,30)),
+    5: (time(14,0), time(23,30)),
+    6: (time(14,0), time(22,30)),
+}
+
+DATE, TIME_STATE, PARTY, NAME, PHONE, CONFIRM = range(6)
 PHONE_RE = re.compile(r"^[+\d][\d\-()\s]{5,}$")
 
 def _human_contacts() -> str:
@@ -84,7 +93,7 @@ def _human_contacts() -> str:
             f"📞 {VENUE_PHONE}\n"
             f"🕒 {VENUE_HOURS}")
 
-def _slots_for_date(d):
+def _slots_for_date(d) -> List[time]:
     open_t, last_t = WEEKLY_RULES.get(d.weekday(), (None, None))
     if not open_t or not last_t:
         return []
@@ -96,6 +105,123 @@ def _slots_for_date(d):
         slots.append(cur_dt.time())
         cur_dt += step
     return slots
+
+def _utc_iso(dt_local: datetime) -> str:
+    return dt_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S")
+
+def _parse_utc_iso(s: str) -> datetime:
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+    return dt
+
+def _date_choices():
+    today = datetime.now(LOCAL_TZ).date()
+    first = today + timedelta(days=MIN_ADVANCE_DAYS)
+    if ONLY_TOMORROW:
+        return [first]
+    return [first + timedelta(days=i) for i in range(0,6)]
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS if ADMIN_IDS else False
+
+def sb_ensure_user(chat_id: int, first_name: str, last_name: str, username: str) -> int:
+    rows = sb_get("users", {"select":"id", "chat_id": f"eq.{chat_id}"})
+    if rows:
+        return rows[0]["id"]
+    row = sb_post("users", {
+        "chat_id": chat_id,
+        "first_name": first_name,
+        "last_name": last_name,
+        "username": username
+    })
+    return row["id"]
+
+def sb_find_available_table(party_size: int, starts_utc_iso: str, ends_utc_iso: str) -> Optional[Dict[str, Any]]:
+    reserved = sb_get("reservations", {
+        "select":"table_id",
+        "status":"in.(pending,confirmed)",
+        "table_id":"not.is.null",
+        "starts_at":f"lt.{ends_utc_iso}",
+        "ends_at":f"gt.{starts_utc_iso}",
+    })
+    reserved_ids = {r["table_id"] for r in reserved if r.get("table_id") is not None}
+    tables = sb_get("tables", {
+        "select":"id,name,capacity",
+        "capacity":f"gte.{party_size}",
+        "order":"capacity.asc"
+    })
+    for t in tables:
+        if t["id"] not in reserved_ids:
+            return t
+    return None
+
+def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
+                          party_size: int, starts_utc_iso: str, ends_utc_iso: str) -> Dict[str, Any]:
+    payload = {
+        "user_id": user_id,
+        "table_id": table_id,
+        "name": name,
+        "phone": phone,
+        "party_size": party_size,
+        "starts_at": starts_utc_iso,
+        "ends_at": ends_utc_iso,
+        "status": "pending",
+    }
+    row = sb_post("reservations", payload)
+    return row
+
+def sb_get_user_by_chat(chat_id: int):
+    rows = sb_get("users", {"select":"id,chat_id,first_name,last_name,username", "chat_id":f"eq.{chat_id}"})
+    return rows[0] if rows else None
+
+def sb_get_reservations_for_user_future(user_id: int):
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    rows = sb_get("reservations", {
+        "select":"id,status,starts_at,ends_at,party_size,table_id",
+        "user_id":f"eq.{user_id}",
+        "ends_at":f"gte.{now_iso}",
+        "order":"starts_at.asc"
+    })
+    return rows
+
+def sb_get_table_names(table_ids: List[int]) -> Dict[int, str]:
+    if not table_ids:
+        return {}
+    uniq = ",".join(str(i) for i in sorted(set(table_ids)))
+    rows = sb_get("tables", {"select":"id,name", "id":f"in.({uniq})"})
+    return {r["id"]: r["name"] for r in rows}
+
+def sb_get_pending():
+    return sb_get("reservations", {
+        "select":"id,name,phone,party_size,starts_at,ends_at,table_id,user_id,status",
+        "status":"eq.pending",
+        "order":"starts_at.asc"
+    })
+
+def sb_get_reservation(res_id: int):
+    rows = sb_get("reservations", {"select":"id,status,table_id,starts_at,party_size,user_id", "id":f"eq.{res_id}"})
+    return rows[0] if rows else None
+
+def sb_update_reservation(res_id: int, payload: Dict[str, Any]):
+    rows = sb_patch("reservations", {"id":f"eq.{res_id}"}, payload)
+    return rows[0] if rows else None
+
+def sb_get_user(user_id: int):
+    rows = sb_get("users", {"select":"id,chat_id,first_name,last_name,username", "id":f"eq.{user_id}"})
+    return rows[0] if rows else None
+
+def sb_get_confirmed_future():
+    now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    return sb_get("reservations", {
+        "select":"id,user_id,starts_at,status",
+        "status":"eq.confirmed",
+        "starts_at":f"gt.{now_iso}",
+        "order":"starts_at.asc"
+    })
+
+def _format_local(dt_utc: datetime) -> str:
+    return dt_utc.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
 
 async def start(update: Update, context: ContextTypes.context):
     text = (
@@ -118,32 +244,6 @@ async def help_cmd(update: Update, context: ContextTypes.context):
 async def contacts_cmd(update: Update, context: ContextTypes.context):
     await update.message.reply_markdown(_human_contacts())
 
-def _date_choices():
-    today = datetime.now(LOCAL_TZ).date()
-    first = today + timedelta(days=MIN_ADVANCE_DAYS)
-    dates = []
-    if ONLY_TOMORROW:
-        dates = [first]
-    else:
-        for i in range(0, 6):
-            dates.append(first + timedelta(days=i))
-    return dates
-
-async def book(update: Update, context: ContextTypes.context):
-    choices = _date_choices()
-    keyboard, row = [], []
-    for i, d in enumerate(choices, start=1):
-        row.append(d.strftime("%Y-%m-%d"))
-        if i % 3 == 0:
-            keyboard.append(row); row = []
-    if row: keyboard.append(row)
-
-    await update.message.reply_text(
-        "Выберите дату (YYYY-MM-DD) или введите вручную:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
-    )
-    return DATE
-
 def parse_date(text: str):
     try:
         return datetime.strptime(text.strip(), "%Y-%m-%d").date()
@@ -157,6 +257,23 @@ def parse_time(text: str):
         except ValueError:
             continue
     return None
+
+def _date_keyboard():
+    choices = _date_choices()
+    keyboard, row = [], []
+    for i, d in enumerate(choices, start=1):
+        row.append(d.strftime("%Y-%m-%d"))
+        if i % 3 == 0:
+            keyboard.append(row); row=[]
+    if row: keyboard.append(row)
+    return keyboard
+
+async def book(update: Update, context: ContextTypes.context):
+    await update.message.reply_text(
+        "Выберите дату (YYYY-MM-DD) или введите вручную:",
+        reply_markup=ReplyKeyboardMarkup(_date_keyboard(), one_time_keyboard=True, resize_keyboard=True),
+    )
+    return DATE
 
 async def book_date(update: Update, context: ContextTypes.context):
     d = parse_date(update.message.text)
@@ -187,14 +304,14 @@ async def book_date(update: Update, context: ContextTypes.context):
         "Во сколько? (например, 19:30)",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
-    return TIME
+    return TIME_STATE
 
 async def book_time(update: Update, context: ContextTypes.context):
     t = parse_time(update.message.text)
     d = context.user_data.get("date")
     if not t or not d:
         await update.message.reply_text("Пожалуйста, укажите время в формате HH:MM, например 19:30.")
-        return TIME
+        return TIME_STATE
     allowed = _slots_for_date(d)
     if t not in allowed:
         open_t, last_t = WEEKLY_RULES[d.weekday()]
@@ -202,7 +319,7 @@ async def book_time(update: Update, context: ContextTypes.context):
             f"В этот день принимаем с {open_t.strftime('%H:%M')} до {last_t.strftime('%H:%M')} (последняя запись). "
             "Выберите время из предложенных."
         )
-        return TIME
+        return TIME_STATE
 
     context.user_data["time"] = t
     keyboard = [["2","3","4"],["5","6","7"],["8"]]
@@ -230,13 +347,13 @@ async def book_name(update: Update, context: ContextTypes.context):
         await update.message.reply_text("Имя слишком короткое. Повторите.")
         return NAME
     context.user_data["name"] = name
-    await update.message.reply_text("Ваш номер телефона (с кодом страны, например +375...):")
+    await update.message.reply_text("Ваш номер телефона (с кодом страны, например +48...):")
     return PHONE
 
 async def book_phone(update: Update, context: ContextTypes.context):
     phone = update.message.text.strip()
     if not PHONE_RE.match(phone):
-        await update.message.reply_text("Похоже, номер некорректен. Введите еще раз (например +375123456789).")
+        await update.message.reply_text("Похоже, номер некорректен. Введите еще раз (например +48 123 456 789).")
         return PHONE
     context.user_data["phone"] = phone
 
@@ -265,21 +382,6 @@ async def book_phone(update: Update, context: ContextTypes.context):
     await update.message.reply_text(text, reply_markup=keyboard)
     return CONFIRM
 
-def find_available_table(con, party_size: int, starts_utc: str, ends_utc: str):
-    sql = """
-    SELECT id, name, capacity FROM tables
-    WHERE capacity >= ?
-    AND id NOT IN (
-        SELECT table_id FROM reservations
-        WHERE status IN ('pending','confirmed')
-        AND table_id IS NOT NULL
-        AND starts_at < ? AND ends_at > ?
-    )
-    ORDER BY capacity ASC
-    """
-    cur = con.execute(sql, (party_size, ends_utc, starts_utc))
-    return cur.fetchone()
-
 async def confirm_callback(update: Update, context: ContextTypes.context):
     query = update.callback_query
     await query.answer()
@@ -287,44 +389,62 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
         await query.edit_message_text("Окей, начнем заново: /book")
         return ConversationHandler.END
 
-    with db() as con:
-        user_id = ensure_user(con, update)
-        starts_local = context.user_data["starts_local"]
-        ends_local = context.user_data["ends_local"]
-        starts_utc = starts_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
-        ends_utc = ends_local.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%d %H:%M:%S")
+    user = update.effective_user
+    starts_local = context.user_data["starts_local"]
+    ends_local = context.user_data["ends_local"]
+    starts_utc_iso = _utc_iso(starts_local)
+    ends_utc_iso = _utc_iso(ends_local)
 
-        table = find_available_table(
-            con,
-            party_size=context.user_data["party"],
-            starts_utc=starts_utc,
-            ends_utc=ends_utc
-        )
+    user_id = sb_ensure_user(
+        chat_id=update.effective_chat.id,
+        first_name=user.first_name, last_name=user.last_name, username=user.username or ""
+    )
 
-        table_id = table["id"] if table else None
-        con.execute(
-            """INSERT INTO reservations (user_id, table_id, name, phone, party_size, starts_at, ends_at, status)
-               VALUES (?,?,?,?,?,?,?, 'pending')""",
-            (
-                user_id,
-                table_id,
-                context.user_data["name"],
-                context.user_data["phone"],
-                context.user_data["party"],
-                starts_utc,
-                ends_utc,
-            )
+    table = sb_find_available_table(
+        party_size=context.user_data["party"],
+        starts_utc_iso=starts_utc_iso,
+        ends_utc_iso=ends_utc_iso
+    )
+    table_id = table["id"] if table else None
+
+    row = sb_insert_reservation(
+        user_id=user_id,
+        table_id=table_id,
+        name=context.user_data["name"],
+        phone=context.user_data["phone"],
+        party_size=context.user_data["party"],
+        starts_utc_iso=starts_utc_iso,
+        ends_utc_iso=ends_utc_iso,
+    )
+    res_id = row["id"]
+
+    if ADMIN_ALERT_BOT_TOKEN and (ADMIN_ALERT_CHAT_IDS or ADMIN_IDS):
+        alert_bot = Bot(token=ADMIN_ALERT_BOT_TOKEN)
+        dt_local_str = _format_local(_parse_utc_iso(starts_utc_iso))
+        table_text = f"{table['name']} (до {table['capacity']})" if table else "—"
+        alert = (
+            f"🆕 Запрос на бронь #{res_id}\n"
+            f"Дата/время: {dt_local_str}\n"
+            f"Гостей: {context.user_data['party']}\n"
+            f"Имя: {context.user_data['name']}\n"
+            f"Телефон: {context.user_data['phone']}\n"
+            f"Предварительный стол: {table_text}\n"
+            f"Статус: pending"
         )
-        res_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-        con.commit()
+        targets = ADMIN_ALERT_CHAT_IDS or list(ADMIN_IDS)
+        for chat_id in targets:
+            try:
+                await alert_bot.send_message(chat_id=chat_id, text=alert)
+            except Exception as e:
+                logger.warning("Failed to send admin alert to %s: %s", chat_id, e)
 
     if table:
         msg = (f"Заявка №{res_id} отправлена ✅\n"
-               f"Пока бронь в ожидании подтверждения администратора.\n"
-               f"Предварительно доступен стол {table['name']} (вмещает до {table['capacity']} гостей).")
+               f"Пока бронь *в ожидании подтверждения* администратора.\n"
+               f"Предварительно доступен стол *{table['name']}* (вмещает до {table['capacity']} гостей).")
     else:
         msg = (f"Заявка №{res_id} отправлена ✅\n"
-               f"Пока бронь в ожидании подтверждения администратора.\n"
+               f"Пока бронь *в ожидании подтверждения* администратора.\n"
                f"Сейчас нет подходящих свободных столов на это время — "
                f"администратор свяжется для альтернативы.")
     msg += "\n\nЕсли появятся вопросы или захотите отменить, свяжитесь с заведением:\n" + _human_contacts()
@@ -332,57 +452,80 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
     return ConversationHandler.END
 
 async def my_reservations(update: Update, context: ContextTypes.context):
-    with db() as con:
-        cur = con.execute("SELECT id FROM users WHERE chat_id=?", (update.effective_chat.id,))
-        row = cur.fetchone()
-        if not row:
-            await update.message.reply_text("У вас пока нет бронирований. Нажмите /book чтобы создать.")
-            return
-        user_id = row["id"]
-        res = con.execute(
-            """SELECT r.id, r.status, r.starts_at, r.ends_at, r.party_size, r.table_id, t.name as table_name
-               FROM reservations r
-               LEFT JOIN tables t ON t.id = r.table_id
-               WHERE r.user_id=? AND r.ends_at >= datetime('now')
-               ORDER BY r.starts_at ASC
-            """,
-            (user_id,)
-        ).fetchall()
-    if not res:
+    u = sb_get_user_by_chat(update.effective_chat.id)
+    if not u:
+        await update.message.reply_text("У вас пока нет бронирований. Нажмите /book чтобы создать.")
+        return
+    rows = sb_get_reservations_for_user_future(u["id"])
+    if not rows:
         await update.message.reply_text("Активных бронирований нет. Нажмите /book чтобы создать.")
         return
+    table_names = sb_get_table_names([r["table_id"] for r in rows if r.get("table_id")])
     lines = []
-    for r in res:
-        starts = datetime.fromisoformat(r["starts_at"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-        status_map = {"pending":"⏳ ожидание","confirmed":"✅ подтверждено","canceled":"❌ отменено"}
-        table_label = r["table_name"] or "—"
+    for r in rows:
+        starts = _format_local(_parse_utc_iso(r["starts_at"]))
+        status_map = {"pending":"⏳ ожидание","confirmed":"✅ подтверждено","canceled":"❌ отменено","stopped":"⛔️ остановлено"}
+        table_label = table_names.get(r.get("table_id"), "—")
         lines.append(f"№{r['id']} • {starts} • {status_map.get(r['status'], r['status'])} • Стол: {table_label} • Гостей: {r['party_size']}")
     lines.append("\nХотите отменить или есть вопросы?\n" + _human_contacts())
     await update.message.reply_markdown("\n".join(lines))
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS if ADMIN_IDS else False
-
 async def admin_pending(update: Update, context: ContextTypes.context):
     if not is_admin(update.effective_user.id):
         return
-    with db() as con:
-        rows = con.execute(
-            """SELECT r.id, r.name, r.phone, r.party_size, r.starts_at, r.ends_at, r.table_id, t.name as table_name, u.chat_id
-               FROM reservations r
-               LEFT JOIN tables t ON t.id = r.table_id
-               JOIN users u ON u.id = r.user_id
-               WHERE r.status='pending' ORDER BY r.starts_at ASC"""
-        ).fetchall()
+    rows = sb_get_pending()
     if not rows:
         await update.message.reply_text("Нет ожидающих заявок.")
         return
+    table_names = sb_get_table_names([r["table_id"] for r in rows if r.get("table_id")])
     lines = ["Ожидают подтверждения:"]
     for r in rows:
-        starts = datetime.fromisoformat(r["starts_at"]).replace(tzinfo=ZoneInfo("UTC")).astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-        table_label = r["table_name"] or "—"
+        starts = _format_local(_parse_utc_iso(r["starts_at"]))
+        table_label = table_names.get(r.get("table_id"), "—")
         lines.append(f"#{r['id']} • {starts} • {r['party_size']} чел • {r['name']} {r['phone']} • стол: {table_label}")
     await update.message.reply_text("\n".join(lines))
+
+async def _schedule_or_send_reminder(app: Application, res_id: int, user_chat_id: int, starts_utc: datetime):
+    when = starts_utc - timedelta(hours=REMINDER_HOURS_BEFORE)
+    now = datetime.now(ZoneInfo("UTC"))
+    job_name = f"reminder_{res_id}"
+    for j in app.job_queue.get_jobs_by_name(job_name):
+        j.schedule_removal()
+    if when <= now and starts_utc > now:
+        try:
+            await app.bot.send_message(
+                chat_id=user_chat_id,
+                text=f"🔔 Напоминание: через {REMINDER_HOURS_BEFORE} ч у вас бронь №{res_id} в {VENUE_NAME}."
+            )
+        except Exception as e:
+            logger.warning("Failed to send immediate reminder: %s", e)
+        return
+    if when > now:
+        app.job_queue.run_once(
+            reminder_job,
+            when=when,
+            name=job_name,
+            data={"res_id": res_id, "user_chat_id": user_chat_id},
+        )
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data
+    res_id = data["res_id"]
+    user_chat_id = data["user_chat_id"]
+    r = sb_get_reservation(res_id)
+    if not r or r.get("status") != "confirmed":
+        return
+    starts_utc = _parse_utc_iso(r["starts_at"])
+    now = datetime.now(ZoneInfo("UTC"))
+    if starts_utc <= now:
+        return
+    try:
+        await context.bot.send_message(
+            chat_id=user_chat_id,
+            text=f"🔔 Напоминание: через {REMINDER_HOURS_BEFORE} ч у вас бронь №{res_id} в {VENUE_NAME}."
+        )
+    except Exception as e:
+        logger.warning("Failed to send reminder: %s", e)
 
 async def admin_confirm(update: Update, context: ContextTypes.context):
     if not is_admin(update.effective_user.id):
@@ -390,45 +533,42 @@ async def admin_confirm(update: Update, context: ContextTypes.context):
     if not context.args:
         await update.message.reply_text("Использование: /confirm <reservation_id>")
         return
-    res_id = context.args[0]
-    with db() as con:
-        row = con.execute(
-            """SELECT r.id, r.status, r.table_id, t.name as table_name, u.chat_id, r.starts_at
-               FROM reservations r
-               LEFT JOIN tables t ON t.id = r.table_id
-               JOIN users u ON u.id = r.user_id
-               WHERE r.id=?""",
-            (res_id,)
-        ).fetchone()
-        if not row:
-            await update.message.reply_text("Бронь не найдена.")
-            return
-        if row["status"] == "confirmed":
-            await update.message.reply_text("Бронь уже подтверждена.")
-            return
-        if row["table_id"] is None:
-            starts_utc = row["starts_at"]
-            ends_utc = (datetime.fromisoformat(starts_utc).replace(tzinfo=ZoneInfo("UTC"))
-                        + timedelta(minutes=RESERVATION_DURATION_MIN)).strftime("%Y-%m-%d %H:%M:%S")
-            res2 = con.execute("SELECT party_size FROM reservations WHERE id=?", (res_id,)).fetchone()
-            table = find_available_table(con, res2["party_size"], starts_utc, ends_utc)
-            if not table:
-                await update.message.reply_text("Подходящих столов нет для подтверждения.")
-                return
-            con.execute("UPDATE reservations SET table_id=? WHERE id=?", (table["id"], res_id))
-            table_name = table["name"]
-        else:
-            table_name = row["table_name"] or "—"
+    res_id = int(context.args[0])
+    row = sb_get_reservation(res_id)
+    if not row:
+        await update.message.reply_text("Бронь не найдена.")
+        return
+    if row["status"] == "confirmed":
+        await update.message.reply_text("Бронь уже подтверждена.")
+        return
 
-        con.execute("UPDATE reservations SET status='confirmed' WHERE id=?", (res_id,))
-        con.commit()
-        chat_id = row["chat_id"]
+    starts_utc = _parse_utc_iso(row["starts_at"])
+    ends_utc = starts_utc + timedelta(minutes=RESERVATION_DURATION_MIN)
 
-    await update.message.reply_text(f"Бронь #{res_id} подтверждена, стол {table_name}. Уведомляю пользователя.")
+    assigned_table_name = None
+    if row.get("table_id") is None:
+        table = sb_find_available_table(row["party_size"], starts_utc.isoformat(timespec="seconds"), ends_utc.isoformat(timespec="seconds"))
+        if not table:
+            await update.message.reply_text("Подходящих столов нет для подтверждения.")
+            return
+        upd = sb_update_reservation(res_id, {"table_id": table["id"], "status":"confirmed"})
+        assigned_table_name = table["name"]
+    else:
+        upd = sb_update_reservation(res_id, {"status":"confirmed"})
+
+    u = sb_get_user(row["user_id"])
+    if not u:
+        await update.message.reply_text("Подтвердил, но не нашёл пользователя для уведомления.")
+        return
+
+    await _schedule_or_send_reminder(context.application, res_id, u["chat_id"], starts_utc)
+
+    await update.message.reply_text(f"Бронь #{res_id} подтверждена, стол {assigned_table_name or '—'}. Уведомляю пользователя.")
     try:
         await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"✅ Ваша бронь №{res_id} подтверждена! До встречи в {VENUE_NAME}. Стол: {table_name}."
+            chat_id=u["chat_id"],
+            text=f"✅ Ваша бронь №{res_id} подтверждена! До встречи в {VENUE_NAME}. "
+                 f"Встречаемся {starts_utc.astimezone(LOCAL_TZ).strftime('%Y-%m-%d %H:%M')}."
         )
     except Exception as e:
         logger.exception("Failed to notify user: %s", e)
@@ -439,35 +579,43 @@ async def admin_cancel(update: Update, context: ContextTypes.context):
     if not context.args:
         await update.message.reply_text("Использование: /cancel_res <reservation_id>")
         return
-    res_id = context.args[0]
-    with db() as con:
-        row = con.execute(
-            """SELECT r.id, r.status, u.chat_id FROM reservations r
-               JOIN users u ON u.id = r.user_id
-               WHERE r.id=?""",
-            (res_id,)
-        ).fetchone()
-        if not row:
-            await update.message.reply_text("Бронь не найдена.")
-            return
-        if row["status"] == "canceled":
-            await update.message.reply_text("Бронь уже отменена.")
-            return
-        con.execute("UPDATE reservations SET status='canceled' WHERE id=?", (res_id,))
-        con.commit()
-        chat_id = row["chat_id"]
+    res_id = int(context.args[0])
+    row = sb_get_reservation(res_id)
+    if not row:
+        await update.message.reply_text("Бронь не найдена.")
+        return
+    if row["status"] == "canceled":
+        await update.message.reply_text("Бронь уже отменена.")
+        return
+    upd = sb_update_reservation(res_id, {"status":"canceled"})
+    u = sb_get_user(row["user_id"])
     await update.message.reply_text(f"Бронь #{res_id} отменена. Оповещаю пользователя.")
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"❌ К сожалению, бронь №{res_id} была отменена. Если есть вопросы, свяжитесь с нами:\n{_human_contacts()}"
-        )
-    except Exception as e:
-        logger.exception("Failed to notify user: %s", e)
+    if u:
+        try:
+            await context.bot.send_message(
+                chat_id=u["chat_id"],
+                text=f"❌ К сожалению, бронь №{res_id} была отменена. Если есть вопросы, свяжитесь с нами:\n{_human_contacts()}"
+            )
+        except Exception as e:
+            logger.exception("Failed to notify user: %s", e)
 
 async def cancel(update: Update, context: ContextTypes.context):
     await update.message.reply_text("Окей, бронирование отменено. Нажмите /book чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
+
+async def on_startup(app: Application):
+    try:
+        rows = sb_get_confirmed_future()
+        for r in rows:
+            res_id = r["id"]
+            starts_utc = _parse_utc_iso(r["starts_at"])
+            u = sb_get_user(r["user_id"])
+            if not u:
+                continue
+            await _schedule_or_send_reminder(app, res_id, u["chat_id"], starts_utc)
+        logger.info("Startup reminders scheduled: %d", len(rows))
+    except Exception as e:
+        logger.exception("Failed to schedule reminders on startup: %s", e)
 
 def build_app():
     app = Application.builder().token(TOKEN).build()
@@ -476,7 +624,7 @@ def build_app():
         entry_points=[CommandHandler("book", book)],
         states={
             DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_date)],
-            TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_time)],
+            TIME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_time)],
             PARTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_party)],
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_name)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_phone)],
@@ -501,7 +649,7 @@ def build_app():
 def main():
     app = build_app()
     logger.info("Bot starting...")
-    app.run_polling()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()

@@ -1,60 +1,105 @@
 
-# Telegram Booking Bot (Python)
+# Telegram Booking Bot (Python, Supabase)
 
-Простой Telegram-бот для бронирования столов. Пользователь выбирает дату, время, кол-во гостей, имя и телефон; бот проверяет доступные столы и создаёт заявку со статусом `pending`. Администратор подтверждает/отменяет заявку — и пользователь получает уведомление. Для вопросов/отмены бот отдаёт контакты заведения.
+Бот для бронирования столов в Telegram с хранением данных в **Supabase** (PostgreSQL через REST). Поддерживает:
+- Пошаговую бронь `/book` (дата/время/гости/имя/телефон)
+- Проверку доступных столов по вместимости и пересечениям
+- Заявка со статусом `pending` → подтверждение/отмена админом в боте
+- **Напоминание пользователю за 2 часа до начала** (JobQueue)
+- **Оповещение админов** о новой заявке через **отдельного бота**
+- Расписание приёма брони (Mon–Sun) и запрет на брони в день обращения
 
-## Новое в этой версии
-- Добавлены **правила приёма брони по дням недели** и **крайние времена записи**:
-  - Пн–Чт 16:00–23:00 (**последняя запись 22:30**)
-  - Пт 16:00–00:00 (**последняя запись 23:30**)
-  - Сб 14:00–00:00 (**последняя запись 23:30**)
-  - Вс 14:00–23:00 (**последняя запись 22:30**)
-- Генерация слотов времени динамически, шагом по умолчанию **30 минут**.
-- Запрет брони в день обращения (`MIN_ADVANCE_DAYS=1`). Опционально режим **"только на завтра"** (`ONLY_TOMORROW=true`).
+## Установка
+```bash
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+pip install python-telegram-bot==21.4 python-dotenv requests
+```
 
-> Примечание: ограничение «последняя запись» относится к **времени начала брони**. Закрытие заведения не ограничивается программно: при необходимости можно дополнительно проверять, чтобы `ends_at` не превышал время закрытия.
+## Настройка
+1) Скопируйте `.env.example` → `.env` и заполните:
+```
+TELEGRAM_BOT_TOKEN=...
+ADMIN_IDS=11111111,22222222
 
-## Быстрый старт
-1. Установить зависимости:
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate  # Windows: .venv\Scripts\activate
-   pip install python-telegram-bot==21.4 python-dotenv
-   ```
-2. Настроить окружение — скопируйте `.env.example` → `.env` и заполните:
-   - `TELEGRAM_BOT_TOKEN` — токен вашего бота
-   - `ADMIN_IDS` — Telegram ID админов (через запятую)
-   - Контакты заведения (`VENUE_*`)
-   - (опц.) `MIN_ADVANCE_DAYS`, `ONLY_TOMORROW`, `TIME_SLOT_STEP_MIN`, `LOCAL_TZ`
-3. Инициализировать БД:
-   ```bash
-   python db_init.py
-   ```
-4. Запустить бота:
-   ```bash
-   python bot.py
-   ```
+# Админ-оповещения через другой бот (опц.)
+ADMIN_ALERT_BOT_TOKEN=...
+ADMIN_ALERT_CHAT_IDS=11111111,22222222
+
+# Контакты заведения
+VENUE_NAME=...
+VENUE_PHONE=...
+VENUE_ADDRESS=...
+VENUE_HOURS=...
+
+# Правила брони
+LOCAL_TZ=Europe/Berlin
+RESERVATION_DURATION_MIN=120
+TIME_SLOT_STEP_MIN=30
+MIN_ADVANCE_DAYS=1
+ONLY_TOMORROW=false
+REMINDER_HOURS_BEFORE=2
+
+# Supabase
+SUPABASE_URL=https://YOUR-PROJECT.supabase.co
+SUPABASE_API_KEY=YOUR_ANON_OR_SERVICE_KEY
+```
+2) Создайте таблицы в Supabase (SQL):
+```sql
+CREATE TABLE IF NOT EXISTS tables (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    capacity INTEGER NOT NULL CHECK (capacity > 0)
+);
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    chat_id INTEGER NOT NULL UNIQUE,
+    first_name TEXT,
+    last_name TEXT,
+    username TEXT
+);
+CREATE TABLE IF NOT EXISTS reservations (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    table_id INTEGER REFERENCES tables(id),
+    name TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    party_size INTEGER NOT NULL,
+    starts_at TIMESTAMP NOT NULL,
+    ends_at TIMESTAMP NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','confirmed','canceled', 'stopped')),
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_res_start_end ON reservations(starts_at, ends_at);
+CREATE INDEX IF NOT EXISTS idx_res_status ON reservations(status);
+```
+3) Засидьте столы (пример):
+```sql
+INSERT INTO tables (name, capacity) VALUES
+('T1',2),('T2',2),('T3',4),('T4',4),('T5',6),('VIP1',8);
+```
+
+## Запуск
+```bash
+python bot.py
+```
+
+## Как это работает
+- Все операции идут через REST Supabase `GET/POST/PATCH /rest/v1/<table>` с заголовками `apikey` и `Authorization`.
+- Поиск занятых столов: `reservations?status=in.(pending,confirmed)&table_id=not.is.null&starts_at=lt.<end>&ends_at=gt.<start>`;
+  затем подбираем минимально подходящий стол из `tables?capacity=gte.<party>&order=capacity.asc`.
+- Напоминания: при подтверждении брони планируется job на `starts_at - REMINDER_HOURS_BEFORE`. При старте бота все будущие `confirmed` проверкиваются и планируются заново.
+- Админ-оповещения: при создании заявки (status=`pending`) отправляем сообщение в `ADMIN_ALERT_CHAT_IDS` через `ADMIN_ALERT_BOT_TOKEN`.
+  Основные админ-команды остаются в **основном** боте.
 
 ## Команды
 - Пользователь: `/book`, `/my`, `/contacts`, `/help`
-- Админ: `/pending`, `/confirm <id>`, `/cancel_res <id>`
+- Админ (в основном боте): `/pending`, `/confirm <id>`, `/cancel_res <id>`
 
-## Настройки времени
-В `bot.py` задан словарь `WEEKLY_RULES` (Python weekday: Mon=0..Sun=6):
-```python
-WEEKLY_RULES = {
-    0: (time(16,0), time(22,30)),
-    1: (time(16,0), time(22,30)),
-    2: (time(16,0), time(22,30)),
-    3: (time(16,0), time(22,30)),
-    4: (time(16,0), time(23,30)),
-    5: (time(14,0), time(23,30)),
-    6: (time(14,0), time(22,30)),
-}
-```
-Генерация слотов — каждые `TIME_SLOT_STEP_MIN` минут **включительно до последнего времени записи**.
+## Время
+Колонки `starts_at`/`ends_at` — тип `TIMESTAMP` (без TZ). Сохраняем время в **UTC** (`YYYY-MM-DDTHH:MM:SS`) и трактуем как UTC при чтении. Отображение пользователю — в `LOCAL_TZ`.
 
 ## Идеи развития
-- Учёт закрытия (не позволять, чтобы `ends_at` выходило за время закрытия).
-- Предоплаты, объединение столов, план зала, мультифилиалы.
-- Веб‑админка (FastAPI) + PostgreSQL.
+- Добавить флаг `reminder_sent` (миграция) для устойчивости к внешним повторам.
+- Ограничить, чтобы `ends_at` не превышало время закрытия.
+- Веб-админка (FastAPI) и RLS в Supabase.

@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     party_size INTEGER NOT NULL,
     starts_at TEXT NOT NULL, -- ISO 8601 timestamp (UTC)
     ends_at TEXT NOT NULL,   -- ISO 8601 timestamp (UTC)
-    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','confirmed','canceled', 'stopped')),
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','confirmed','canceled')),
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
