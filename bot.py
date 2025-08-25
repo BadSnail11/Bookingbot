@@ -4,7 +4,7 @@ import re
 import logging
 from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -42,6 +42,8 @@ TIME_SLOT_STEP_MIN = int(os.getenv("TIME_SLOT_STEP_MIN", "30"))
 MIN_ADVANCE_DAYS = int(os.getenv("MIN_ADVANCE_DAYS", "1"))
 ONLY_TOMORROW = os.getenv("ONLY_TOMORROW", "false").lower() in ("1", "true", "yes", "y")
 REMINDER_HOURS_BEFORE = int(os.getenv("REMINDER_HOURS_BEFORE", "2"))
+DAILY_RESERVATION_LIMIT = int(os.getenv("DAILY_RESERVATION_LIMIT", "2"))
+RES_LIMIT_SCOPE = os.getenv("RES_LIMIT_SCOPE", "global").lower()
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Moscow"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -121,6 +123,28 @@ def _date_choices():
     if ONLY_TOMORROW:
         return [first]
     return [first + timedelta(days=i) for i in range(0,6)]
+
+def _utc_bounds_for_local_date(d) -> Tuple[str, str]:
+    """Вернёт UTC-границы для локальной календарной даты d: [start, end)."""
+    start_local = datetime.combine(d, time(0, 0)).replace(tzinfo=LOCAL_TZ)
+    end_local = start_local + timedelta(days=1)
+    return _utc_iso(start_local), _utc_iso(end_local)
+
+def sb_count_reservations_in_day(day_start_utc_iso: str, day_end_utc_iso: str, user_id: int | None = None) -> int:
+    """
+    Считает брони на дату (исключая canceled). Учитываем pending/confirmed/stopped.
+    Если передан user_id — считаем только для этого пользователя (для режима per_user).
+    """
+    params = {
+        "select": "id",
+        "status": "in.(pending,confirmed,stopped)",
+        # PostgREST: комбинированный фильтр через and=
+        "and": f"(starts_at.gte.{day_start_utc_iso},starts_at.lt.{day_end_utc_iso})",
+    }
+    if user_id is not None:
+        params["user_id"] = f"eq.{user_id}"
+    rows = sb_get("reservations", params)
+    return len(rows)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS if ADMIN_IDS else False
@@ -395,10 +419,24 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
     starts_utc_iso = _utc_iso(starts_local)
     ends_utc_iso = _utc_iso(ends_local)
 
+    
+
     user_id = sb_ensure_user(
         chat_id=update.effective_chat.id,
         first_name=user.first_name, last_name=user.last_name, username=user.username or ""
     )
+
+    day_start_utc_iso, day_end_utc_iso = _utc_bounds_for_local_date(context.user_data["date"])
+    user_id_for_limit = user_id if RES_LIMIT_SCOPE == "per_user" else None
+    current_count = sb_count_reservations_in_day(day_start_utc_iso, day_end_utc_iso, user_id_for_limit)
+
+    if current_count >= DAILY_RESERVATION_LIMIT:
+        scope_text = "на пользователя" if RES_LIMIT_SCOPE == "per_user" else "на заведение"
+        await query.edit_message_text(
+            f"К сожалению, на выбранную дату достигнут лимит бронирований "
+            f"({DAILY_RESERVATION_LIMIT} {scope_text} в день). Пожалуйста, выберите другую дату."
+        )
+        return ConversationHandler.END
 
     table = sb_find_available_table(
         party_size=context.user_data["party"],
