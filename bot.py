@@ -347,13 +347,13 @@ async def book_name(update: Update, context: ContextTypes.context):
         await update.message.reply_text("Имя слишком короткое. Повторите.")
         return NAME
     context.user_data["name"] = name
-    await update.message.reply_text("Ваш номер телефона (с кодом страны, например +48...):")
+    await update.message.reply_text("Ваш номер телефона (с кодом страны, например +375...):")
     return PHONE
 
 async def book_phone(update: Update, context: ContextTypes.context):
     phone = update.message.text.strip()
     if not PHONE_RE.match(phone):
-        await update.message.reply_text("Похоже, номер некорректен. Введите еще раз (например +48 123 456 789).")
+        await update.message.reply_text("Похоже, номер некорректен. Введите еще раз (например +375123456789).")
         return PHONE
     context.user_data["phone"] = phone
 
@@ -439,12 +439,10 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
                 logger.warning("Failed to send admin alert to %s: %s", chat_id, e)
 
     if table:
-        msg = (f"Заявка №{res_id} отправлена ✅\n"
-               f"Пока бронь *в ожидании подтверждения* администратора.\n"
-               f"Предварительно доступен стол *{table['name']}* (вмещает до {table['capacity']} гостей).")
+        msg = (f"Пока бронь в ожидании подтверждения администратора.\n"
+               f"Предварительно доступен стол {table['name']} (вмещает до {table['capacity']} гостей).")
     else:
-        msg = (f"Заявка №{res_id} отправлена ✅\n"
-               f"Пока бронь *в ожидании подтверждения* администратора.\n"
+        msg = (f"Пока бронь в ожидании подтверждения администратора.\n"
                f"Сейчас нет подходящих свободных столов на это время — "
                f"администратор свяжется для альтернативы.")
     msg += "\n\nЕсли появятся вопросы или захотите отменить, свяжитесь с заведением:\n" + _human_contacts()
