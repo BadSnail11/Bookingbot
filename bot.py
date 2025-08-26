@@ -124,7 +124,7 @@ def _date_choices():
     first = today + timedelta(days=MIN_ADVANCE_DAYS)
     if ONLY_TOMORROW:
         return [first]
-    return [first + timedelta(days=i) for i in range(0,6)]
+    return [first + timedelta(days=i) for i in range(0,10)]
 
 def _utc_bounds_for_local_date(d) -> Tuple[str, str]:
     """Вернёт UTC-границы для локальной календарной даты d: [start, end)."""
@@ -273,7 +273,7 @@ async def contacts_cmd(update: Update, context: ContextTypes.context):
 
 def parse_date(text: str):
     try:
-        return datetime.strptime(text.strip(), "%Y-%m-%d").date()
+        return datetime.strptime(text.strip(), "%d.%m.%Y").date()
     except ValueError:
         return None
 
@@ -289,7 +289,7 @@ def _date_keyboard():
     choices = _date_choices()
     keyboard, row = [], []
     for i, d in enumerate(choices, start=1):
-        row.append(d.strftime("%Y-%m-%d"))
+        row.append(d.strftime("%d.%m.%Y"))
         if i % 3 == 0:
             keyboard.append(row); row=[]
     if row: keyboard.append(row)
