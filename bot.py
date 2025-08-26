@@ -59,7 +59,7 @@ SB_HEADERS = {
     "Accept": "application/json",
 }
 
-BLOCKED_DATES = [str(x) for x in os.getenv("BLOCKED_DATES","").replace(" ","").split(",") if x.strip().isalpha()]
+BLOCKED_DATES = [str(x) for x in os.getenv("BLOCKED_DATES","").replace(" ","").split(",") if x.strip()]
 
 def sb_get(table: str, params: Dict[str, str]) -> List[Dict[str, Any]]:
     r = requests.get(f"{REST_BASE}/{table}", headers=SB_HEADERS, params=params, timeout=20)
@@ -306,6 +306,7 @@ async def book_date(update: Update, context: ContextTypes.context):
     d = parse_date(update.message.text)
     today = datetime.now(LOCAL_TZ).date()
     min_date = today + timedelta(days=MIN_ADVANCE_DAYS)
+    # print(d, [parse_date(el) for el in BLOCKED_DATES], BLOCKED_DATES)
     if d in [parse_date(el) for el in BLOCKED_DATES]:
         await update.message.reply_text("К сожаленю, бронирование в эту дату недоступно.")
         return DATE
