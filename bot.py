@@ -86,7 +86,7 @@ WEEKLY_RULES = {
     6: (time(14,0), time(22,30)),
 }
 
-DATE, TIME_STATE, PARTY, NAME, PHONE, CONFIRM = range(6)
+DATE, TIME_STATE, PARTY, SETS, NAME, PHONE, CONFIRM = range(7)
 PHONE_RE = re.compile(r"^[+\d][\d\-()\s]{5,}$")
 
 def _human_contacts() -> str:
@@ -137,9 +137,9 @@ def sb_count_reservations_in_day(day_start_utc_iso: str, day_end_utc_iso: str, u
     """
     params = {
         "select": "id",
-        "status": "in.(pending,confirmed,stopped)",
+        "status": "in.(confirmed,pending)",
         # PostgREST: комбинированный фильтр через and=
-        "and": f"(starts_at.gte.{day_start_utc_iso},starts_at.lt.{day_end_utc_iso})",
+        "and": f"(created_at.gte.{day_start_utc_iso},created_at.lt.{day_end_utc_iso})",
     }
     if user_id is not None:
         params["user_id"] = f"eq.{user_id}"
@@ -181,13 +181,14 @@ def sb_find_available_table(party_size: int, starts_utc_iso: str, ends_utc_iso: 
     return None
 
 def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
-                          party_size: int, starts_utc_iso: str, ends_utc_iso: str) -> Dict[str, Any]:
+                          party_size: int, starts_utc_iso: str, ends_utc_iso: str, set_count: Optional[int]) -> Dict[str, Any]:
     payload = {
         "user_id": user_id,
         "table_id": table_id,
         "name": name,
         "phone": phone,
         "party_size": party_size,
+        "set_count": set_count,
         "starts_at": starts_utc_iso,
         "ends_at": ends_utc_iso,
         "status": "pending",
@@ -362,6 +363,24 @@ async def book_party(update: Update, context: ContextTypes.context):
         await update.message.reply_text("Укажите число гостей (целое положительное).")
         return PARTY
     context.user_data["party"] = party
+    keyboard = [["0","1","2","3","4"], ["5","6","7","8","9"]]
+    await update.message.reply_text(
+        "Сколько сетов хотите предзаказать? (0 — решим на месте)",
+        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
+    )
+    return SETS
+
+async def book_sets(update: Update, context: ContextTypes.context):
+    try:
+        sets = int(update.message.text.strip())
+        # легкая валидация, при желании скорректируй
+        if sets < 0 or sets > 100:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Укажите количество сетов числом (0 или больше).")
+        return SETS
+
+    context.user_data["set_count"] = sets
     await update.message.reply_text("Ваше имя и фамилия:", reply_markup=ReplyKeyboardRemove())
     return NAME
 
@@ -395,6 +414,7 @@ async def book_phone(update: Update, context: ContextTypes.context):
         f"📅 Дата: {d.isoformat()}\n"
         f"⏰ Время: {t.strftime('%H:%M')}\n"
         f"👥 Гостей: {party}\n"
+        f"🍣 Сеты: {context.user_data.get('set_count', 0)}\n"
         f"🧾 Имя: {context.user_data['name']}\n"
         f"📞 Телефон: {phone}\n\n"
         f"Подтверждаете?"
@@ -426,7 +446,9 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
         first_name=user.first_name, last_name=user.last_name, username=user.username or ""
     )
 
-    day_start_utc_iso, day_end_utc_iso = _utc_bounds_for_local_date(context.user_data["date"])
+    today = datetime.now(LOCAL_TZ).date()
+    # day_start_utc_iso, day_end_utc_iso = _utc_bounds_for_local_date(context.user_data["date"])
+    day_start_utc_iso, day_end_utc_iso = _utc_bounds_for_local_date(today)
     user_id_for_limit = user_id if RES_LIMIT_SCOPE == "per_user" else None
     current_count = sb_count_reservations_in_day(day_start_utc_iso, day_end_utc_iso, user_id_for_limit)
 
@@ -451,6 +473,7 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
         name=context.user_data["name"],
         phone=context.user_data["phone"],
         party_size=context.user_data["party"],
+        set_count=context.user_data.get("set_count"),
         starts_utc_iso=starts_utc_iso,
         ends_utc_iso=ends_utc_iso,
     )
@@ -464,6 +487,7 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
             f"🆕 Запрос на бронь #{res_id}\n"
             f"Дата/время: {dt_local_str}\n"
             f"Гостей: {context.user_data['party']}\n"
+            f"Сеты: {context.user_data.get('set_count', 0)}\n"
             f"Имя: {context.user_data['name']}\n"
             f"Телефон: {context.user_data['phone']}\n"
             f"Предварительный стол: {table_text}\n"
@@ -662,6 +686,7 @@ def build_app():
             DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_date)],
             TIME_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_time)],
             PARTY: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_party)],
+            SETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_sets)],
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_name)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_phone)],
             CONFIRM: [CallbackQueryHandler(confirm_callback, pattern="^confirm_(yes|no)$")],
