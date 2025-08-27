@@ -251,6 +251,31 @@ def _format_local(dt_utc: datetime) -> str:
     return dt_utc.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
 
 async def start(update: Update, context: ContextTypes.context):
+    try:
+        chat = await context.bot.get_chat(update.effective_chat.id)
+        if chat.pinned_message:
+            await context.bot.unpin_chat_message(
+                chat_id=update.effective_chat.id,
+                message_id=chat.pinned_message.message_id
+            )
+    except:
+        pass
+
+    faq_text = (
+        "Всем мяу! "
+        "Делюсь ответами на частые вопросы:"
+        "1. Если забронирован стол по телефону, то не нужно бронировать его заново через бот. Брони, сделаные по номеру телефона-актуальны"
+        "2. Отмена бронирования связана с загрузкой в определенные даты и время. Позже загруженные временные слоты не будут доступны, но пока что, мы отменяем Ваши брони вручную по этой причине "
+        "3. С 28.08-01.09 все доступное время забронировано, поэтому эти даты неактивны. "
+        "4. Мы не бронируем барную стойку, она только по приходу. "
+        "Вроде все) "
+        "Буду рада ответить на Ваши вопросы тут (https://t.me/ayilesa). Ну и всех приглашаем на гастрофест!)"
+    )
+
+    message = await update.message.chat.send_message(faq_text)
+
+    await message.pin()
+    
     text = (
         "Привет! Я бот для бронирования столов.\n\n"
         "Команды:\n"
