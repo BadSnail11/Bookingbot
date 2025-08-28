@@ -354,13 +354,14 @@ async def book_date(update: Update, context: ContextTypes.context):
         return DATE
     context.user_data["date"] = d
 
-    labels = [t.strftime("%H:%M") for t in slots]
-    keyboard = [labels[i:i+4] for i in range(0, len(labels), 4)]
+    
+    keyboard = [["2","3","4"],["5","6","7"],["8"]]
     await update.message.reply_text(
-        "Во сколько? (например, 19:30)",
+        "Сколько человек?",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
-    return TIME_STATE
+    
+    return PARTY
 
 async def book_time(update: Update, context: ContextTypes.context):
     t = parse_time(update.message.text)
@@ -378,12 +379,32 @@ async def book_time(update: Update, context: ContextTypes.context):
         return TIME_STATE
 
     context.user_data["time"] = t
-    keyboard = [["2","3","4"],["5","6","7"],["8"]]
+
+    starts_local = datetime.combine(d, t).replace(tzinfo=LOCAL_TZ)
+    ends_local = starts_local + timedelta(minutes=RESERVATION_DURATION_MIN)
+    starts_utc_iso = _utc_iso(starts_local)
+    ends_utc_iso = _utc_iso(ends_local)
+
+    table = sb_find_available_table(
+        party_size=context.user_data["party"],
+        starts_utc_iso=starts_utc_iso,
+        ends_utc_iso=ends_utc_iso
+    )
+    table_id = table["id"] if table else None
+    if table_id is None:
+        await update.message.reply_text(
+            f"К сожалению, на выбранное время невозможно найти стол. "
+            f"Пожалуйста, выберите другое время /book"
+        )
+        return TIME_STATE
+        # return ConversationHandler.END
+
+    keyboard = [["0","1","2","3","4"], ["5","6","7","8","9"]]
     await update.message.reply_text(
-        "Сколько человек?",
+        "Сколько сетов хотите предзаказать? (0 — решим на месте)",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
-    return PARTY
+    return SETS
 
 async def book_party(update: Update, context: ContextTypes.context):
     try:
@@ -394,12 +415,15 @@ async def book_party(update: Update, context: ContextTypes.context):
         await update.message.reply_text("Укажите число гостей (целое положительное).")
         return PARTY
     context.user_data["party"] = party
-    keyboard = [["0","1","2","3","4"], ["5","6","7","8","9"]]
+
+    slots = _slots_for_date(context.user_data["date"])
+    labels = [t.strftime("%H:%M") for t in slots]
+    keyboard = [labels[i:i+4] for i in range(0, len(labels), 4)]
     await update.message.reply_text(
-        "Сколько сетов хотите предзаказать? (0 — решим на месте)",
+        "Во сколько? (например, 19:30)",
         reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True),
     )
-    return SETS
+    return TIME_STATE
 
 async def book_sets(update: Update, context: ContextTypes.context):
     try:
