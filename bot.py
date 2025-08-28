@@ -394,7 +394,7 @@ async def book_time(update: Update, context: ContextTypes.context):
     if table_id is None:
         await update.message.reply_text(
             f"К сожалению, на выбранное время невозможно найти стол. "
-            f"Пожалуйста, выберите другое время /book"
+            f"Пожалуйста, выберите другое время:"
         )
         return TIME_STATE
         # return ConversationHandler.END
