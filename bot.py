@@ -88,7 +88,7 @@ WEEKLY_RULES = {
     6: (time(14,0), time(22,30)),
 }
 
-DATE, TIME_STATE, PARTY, SETS, NAME, PHONE, CONFIRM = range(7)
+DATE, TIME_STATE, PARTY, SETS, NAME, PHONE, COMMENT, CONFIRM = range(8)
 PHONE_RE = re.compile(r"^[+\d][\d\-()\s]{5,}$")
 
 def _human_contacts() -> str:
@@ -164,18 +164,30 @@ def sb_ensure_user(chat_id: int, first_name: str, last_name: str, username: str)
     return row["id"]
 
 def sb_find_available_table(party_size: int, starts_utc_iso: str, ends_utc_iso: str) -> Optional[Dict[str, Any]]:
-    reserved = sb_get("reservations", {
-        "select":"table_id",
-        "status":"in.(pending,confirmed)",
-        "table_id":"not.is.null",
-        "starts_at":f"lt.{ends_utc_iso}",
-        "ends_at":f"gt.{starts_utc_iso}",
-    })
-    reserved_ids = {r["table_id"] for r in reserved if r.get("table_id") is not None}
+    # reserved = sb_get("reservations", {
+    #     "select":"table_id",
+    #     "status":"in.(pending,confirmed)",
+    #     "table_id":"not.is.null",
+    #     "starts_at":f"lt.{ends_utc_iso}",
+    #     "ends_at":f"gt.{starts_utc_iso}",
+    # })
+    # reserved_ids = {r["table_id"] for r in reserved if r.get("table_id") is not None}
+    # tables = sb_get("tables", {
+    #     "select":"id,name,capacity",
+    #     "capacity":f"gte.{party_size}",
+    #     "order":"capacity.asc"
+    # })
+    # for t in tables:
+    #     if t["id"] not in reserved_ids:
+    #         return t
+    # return None
+    reserved_ids = sb_reserved_table_ids(starts_utc_iso, ends_utc_iso)
+
+    # кандидаты по вместимости — отсортированы от меньшей к большей
     tables = sb_get("tables", {
-        "select":"id,name,capacity",
-        "capacity":f"gte.{party_size}",
-        "order":"capacity.asc"
+        "select": "id,name,capacity",
+        "capacity": f"gte.{party_size}",
+        "order": "capacity.asc"
     })
     for t in tables:
         if t["id"] not in reserved_ids:
@@ -246,6 +258,51 @@ def sb_get_confirmed_future():
         "starts_at":f"gt.{now_iso}",
         "order":"starts_at.asc"
     })
+
+def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
+                          party_size: int, starts_utc_iso: str, ends_utc_iso: str,
+                          set_count: Optional[int] = None,
+                          comment: Optional[str] = None) -> Dict[str, Any]:
+    payload = {
+        "user_id": user_id,
+        "table_id": table_id,
+        "name": name,
+        "phone": phone,
+        "party_size": party_size,
+        "starts_at": starts_utc_iso,
+        "ends_at": ends_utc_iso,
+        "status": "pending",
+    }
+    if set_count is not None:
+        payload["set_count"] = set_count
+    if comment:
+        payload["comment"] = comment
+
+    row = sb_post("reservations", payload)
+    return row
+
+
+def sb_reserved_table_ids(starts_utc_iso: str, ends_utc_iso: str) -> set[int]:
+    """
+    Возвращает множество id столов, занятых в интервале [starts, ends) бронированиями
+    со статусами pending/confirmed. Учитывает как table_id, так и joined_table_id.
+    """
+    rows = sb_get("reservations", {
+        "select": "table_id,joined_table_id",
+        "status": "in.(pending,confirmed)",
+        "starts_at": f"lt.{ends_utc_iso}",
+        "ends_at": f"gt.{starts_utc_iso}",
+    })
+    taken: set[int] = set()
+    for r in rows:
+        tid = r.get("table_id")
+        jtid = r.get("joined_table_id")
+        if tid is not None:
+            taken.add(tid)
+        if jtid is not None:
+            taken.add(jtid)
+    return taken
+
 
 def _format_local(dt_utc: datetime) -> str:
     return dt_utc.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
@@ -455,12 +512,58 @@ async def book_phone(update: Update, context: ContextTypes.context):
         return PHONE
     context.user_data["phone"] = phone
 
+    # d = context.user_data["date"]
+    # t = context.user_data["time"]
+    # party = context.user_data["party"]
+    # starts_local = datetime.combine(d, t).replace(tzinfo=LOCAL_TZ)
+    # ends_local = starts_local + timedelta(minutes=RESERVATION_DURATION_MIN)
+
+    # context.user_data["starts_local"] = starts_local
+    # context.user_data["ends_local"] = ends_local
+
+    # text = (
+    #     f"Проверьте данные:\n"
+    #     f"📅 Дата: {d.isoformat()}\n"
+    #     f"⏰ Время: {t.strftime('%H:%M')}\n"
+    #     f"👥 Гостей: {party}\n"
+    #     f"🍣 Сеты: {context.user_data.get('set_count', 0)}\n"
+    #     f"🧾 Имя: {context.user_data['name']}\n"
+    #     f"📞 Телефон: {phone}\n\n"
+    #     f"Подтверждаете?"
+    # )
+    # keyboard = InlineKeyboardMarkup([
+    #     [InlineKeyboardButton("Отправить заявку", callback_data="confirm_yes"),
+    #      InlineKeyboardButton("Изменить", callback_data="confirm_no")]
+    # ])
+    # await update.message.reply_text(text, reply_markup=keyboard)
+    # return CONFIRM
+
+    await update.message.reply_text(
+        "Оставите комментарий к бронированию? (например, пожелание по столу, детское кресло и т. п.)\n"
+        "Если нет — нажмите «Пропустить».",
+        reply_markup=ReplyKeyboardMarkup([["Пропустить"]], one_time_keyboard=True, resize_keyboard=True),
+    )
+    return COMMENT
+
+async def book_comment(update: Update, context: ContextTypes.context):
+    txt = (update.message.text or "").strip()
+    if txt.lower() == "пропустить":
+        txt = ""
+    if len(txt) > 500:
+        await update.message.reply_text("Комментарий слишком длинный (до 500 символов). Попробуйте короче.")
+        return COMMENT
+
+    context.user_data["comment"] = txt
+
+    # сформируем локальные даты и превью перед подтверждением
     d = context.user_data["date"]
     t = context.user_data["time"]
     party = context.user_data["party"]
+    name = context.user_data["name"]
+    phone = context.user_data["phone"]
+
     starts_local = datetime.combine(d, t).replace(tzinfo=LOCAL_TZ)
     ends_local = starts_local + timedelta(minutes=RESERVATION_DURATION_MIN)
-
     context.user_data["starts_local"] = starts_local
     context.user_data["ends_local"] = ends_local
 
@@ -470,7 +573,8 @@ async def book_phone(update: Update, context: ContextTypes.context):
         f"⏰ Время: {t.strftime('%H:%M')}\n"
         f"👥 Гостей: {party}\n"
         f"🍣 Сеты: {context.user_data.get('set_count', 0)}\n"
-        f"🧾 Имя: {context.user_data['name']}\n"
+        f"💬 Комментарий: {txt or '—'}\n"
+        f"🧾 Имя: {name}\n"
         f"📞 Телефон: {phone}\n\n"
         f"Подтверждаете?"
     )
@@ -531,6 +635,7 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
         set_count=context.user_data.get("set_count"),
         starts_utc_iso=starts_utc_iso,
         ends_utc_iso=ends_utc_iso,
+        comment=context.user_data.get("comment"),
     )
     res_id = row["id"]
 
@@ -546,6 +651,7 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
             f"Имя: {context.user_data['name']}\n"
             f"Телефон: {context.user_data['phone']}\n"
             f"Предварительный стол: {table_text}\n"
+            f"Комментарий: {context.user_data.get('comment','—')}\n"
             f"Статус: pending"
         )
         targets = ADMIN_ALERT_CHAT_IDS or list(ADMIN_IDS)
@@ -744,6 +850,7 @@ def build_app():
             SETS: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_sets)],
             NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_name)],
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_phone)],
+            COMMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, book_comment)],
             CONFIRM: [CallbackQueryHandler(confirm_callback, pattern="^confirm_(yes|no)$")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
