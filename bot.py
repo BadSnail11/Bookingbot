@@ -45,6 +45,7 @@ REMINDER_HOURS_BEFORE = int(os.getenv("REMINDER_HOURS_BEFORE", "2"))
 DAILY_RESERVATION_LIMIT = int(os.getenv("DAILY_RESERVATION_LIMIT", "2"))
 RES_LIMIT_SCOPE = os.getenv("RES_LIMIT_SCOPE", "global").lower()
 LOCAL_TZ = ZoneInfo(os.getenv("LOCAL_TZ", "Europe/Moscow"))
+AUTO_CONFIRM_MAX_PARTY = int(os.getenv("AUTO_CONFIRM_MAX_PARTY", "4"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_API_KEY = os.getenv("SUPABASE_API_KEY")
@@ -195,7 +196,7 @@ def sb_find_available_table(party_size: int, starts_utc_iso: str, ends_utc_iso: 
     return None
 
 def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
-                          party_size: int, starts_utc_iso: str, ends_utc_iso: str, set_count: Optional[int]) -> Dict[str, Any]:
+                          party_size: int, starts_utc_iso: str, ends_utc_iso: str, set_count: Optional[int], comment: Optional[str] = None, status: str = "pending") -> Dict[str, Any]:
     payload = {
         "user_id": user_id,
         "table_id": table_id,
@@ -205,8 +206,10 @@ def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phon
         "set_count": set_count,
         "starts_at": starts_utc_iso,
         "ends_at": ends_utc_iso,
-        "status": "pending",
+        "status": status,
     }
+    if comment:
+        payload["comment"] = comment
     row = sb_post("reservations", payload)
     return row
 
@@ -262,7 +265,8 @@ def sb_get_confirmed_future():
 def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
                           party_size: int, starts_utc_iso: str, ends_utc_iso: str,
                           set_count: Optional[int] = None,
-                          comment: Optional[str] = None) -> Dict[str, Any]:
+                          comment: Optional[str] = None,
+                          status: str = "pending") -> Dict[str, Any]:
     payload = {
         "user_id": user_id,
         "table_id": table_id,
@@ -271,7 +275,7 @@ def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phon
         "party_size": party_size,
         "starts_at": starts_utc_iso,
         "ends_at": ends_utc_iso,
-        "status": "pending",
+        "status": status,
     }
     if set_count is not None:
         payload["set_count"] = set_count
@@ -626,6 +630,12 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
     )
     table_id = table["id"] if table else None
 
+    should_auto_confirm = (
+    context.user_data["party"] <= AUTO_CONFIRM_MAX_PARTY
+    and table is not None)
+
+    status_for_insert = "confirmed" if should_auto_confirm else "pending"
+
     row = sb_insert_reservation(
         user_id=user_id,
         table_id=table_id,
@@ -636,6 +646,7 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
         starts_utc_iso=starts_utc_iso,
         ends_utc_iso=ends_utc_iso,
         comment=context.user_data.get("comment"),
+        status=status_for_insert,
     )
     res_id = row["id"]
 
@@ -652,7 +663,7 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
             f"Телефон: {context.user_data['phone']}\n"
             f"Предварительный стол: {table_text}\n"
             f"Комментарий: {context.user_data.get('comment','—')}\n"
-            f"Статус: pending"
+            f"Статус: {status_for_insert}"
         )
         targets = ADMIN_ALERT_CHAT_IDS or list(ADMIN_IDS)
         for chat_id in targets:
@@ -661,15 +672,23 @@ async def confirm_callback(update: Update, context: ContextTypes.context):
             except Exception as e:
                 logger.warning("Failed to send admin alert to %s: %s", chat_id, e)
 
-    if table:
-        msg = (f"Пока бронь в ожидании подтверждения администратора.\n"
-               f"Предварительно доступен стол {table['name']} (вмещает до {table['capacity']} гостей).")
+    if should_auto_confirm:
+    # отвечаем пользователю — сразу подтверждение
+        await query.edit_message_text(
+            f"✅ Ваша бронь №{res_id} подтверждена! Встречаемся "
+            f"{_format_local(_parse_utc_iso(starts_utc_iso))} в {VENUE_NAME}. "
+            f"Стол: {table['name']}."
+        )
     else:
-        msg = (f"Пока бронь в ожидании подтверждения администратора.\n"
-               f"Сейчас нет подходящих свободных столов на это время — "
-               f"администратор свяжется для альтернативы.")
-    msg += "\n\nЕсли появятся вопросы или захотите отменить, свяжитесь с заведением:\n" + _human_contacts()
-    await query.edit_message_text(msg)
+        if table:
+            msg = (f"Пока бронь в ожидании подтверждения администратора.\n"
+                f"Предварительно доступен стол {table['name']} (вмещает до {table['capacity']} гостей).")
+        else:
+            msg = (f"Пока бронь в ожидании подтверждения администратора.\n"
+                f"Сейчас нет подходящих свободных столов на это время — "
+                f"администратор свяжется для альтернативы.")
+        msg += "\n\nЕсли появятся вопросы или захотите отменить, свяжитесь с заведением:\n" + _human_contacts()
+        await query.edit_message_text(msg)
     return ConversationHandler.END
 
 async def my_reservations(update: Update, context: ContextTypes.context):
