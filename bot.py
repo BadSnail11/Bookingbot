@@ -207,9 +207,10 @@ def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phon
         "starts_at": starts_utc_iso,
         "ends_at": ends_utc_iso,
         "status": status,
+        "comment": comment,
     }
-    if comment:
-        payload["comment"] = comment
+    # if comment:
+    #     payload["comment"] = comment
     row = sb_post("reservations", payload)
     return row
 
@@ -262,28 +263,28 @@ def sb_get_confirmed_future():
         "order":"starts_at.asc"
     })
 
-def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
-                          party_size: int, starts_utc_iso: str, ends_utc_iso: str,
-                          set_count: Optional[int] = None,
-                          comment: Optional[str] = "",
-                          status: str = "pending") -> Dict[str, Any]:
-    payload = {
-        "user_id": user_id,
-        "table_id": table_id,
-        "name": name,
-        "phone": phone,
-        "party_size": party_size,
-        "starts_at": starts_utc_iso,
-        "ends_at": ends_utc_iso,
-        "status": status,
-    }
-    if set_count is not None:
-        payload["set_count"] = set_count
-    if comment:
-        payload["comment"] = comment
+# def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
+#                           party_size: int, starts_utc_iso: str, ends_utc_iso: str,
+#                           set_count: Optional[int] = None,
+#                           comment: Optional[str] = "",
+#                           status: str = "pending") -> Dict[str, Any]:
+#     payload = {
+#         "user_id": user_id,
+#         "table_id": table_id,
+#         "name": name,
+#         "phone": phone,
+#         "party_size": party_size,
+#         "starts_at": starts_utc_iso,
+#         "ends_at": ends_utc_iso,
+#         "status": status,
+#     }
+#     if set_count is not None:
+#         payload["set_count"] = set_count
+#     if comment:
+#         payload["comment"] = comment
 
-    row = sb_post("reservations", payload)
-    return row
+#     row = sb_post("reservations", payload)
+#     return row
 
 
 def sb_reserved_table_ids(starts_utc_iso: str, ends_utc_iso: str) -> set[int]:
