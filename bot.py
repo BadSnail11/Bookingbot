@@ -265,7 +265,7 @@ def sb_get_confirmed_future():
 def sb_insert_reservation(user_id: int, table_id: Optional[int], name: str, phone: str,
                           party_size: int, starts_utc_iso: str, ends_utc_iso: str,
                           set_count: Optional[int] = None,
-                          comment: Optional[str] = None,
+                          comment: Optional[str] = "",
                           status: str = "pending") -> Dict[str, Any]:
     payload = {
         "user_id": user_id,
